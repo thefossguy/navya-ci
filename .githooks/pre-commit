@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -xeuf -o pipefail
+
+cargo build --quiet
+cargo fmt --quiet --check
