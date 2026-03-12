@@ -7,6 +7,7 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use lexopt;
 
@@ -235,14 +236,15 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
             }
         }
     }
-    let can_write_to_flake_local_reference = fs::OpenOptions::new()
+    let can_write_to_flake_local_reference: bool = match fs::OpenOptions::new()
         .write(true)
-        .open(&flake_local_reference_unwrapped)
-        .map(|_| {
-            fs::remove_file(Path::new(&flake_local_reference_unwrapped).join(".write_check")).ok();
-            true
-        })
-        .unwrap_or(false);
+        .open(format!("{}/flake.nix", &flake_local_reference_unwrapped))
+    {
+        Err(_) => false,
+        Ok(flakefile_fd) => flakefile_fd
+            .set_times(fs::FileTimes::new().set_modified(SystemTime::now()))
+            .is_ok(),
+    };
     if !can_write_to_flake_local_reference {
         return Err("Cannot modify the specified flake path".into());
     }
@@ -383,7 +385,6 @@ fn was_lockfile_updated_in_last_sleep_break(lockfile_path: &str, threshold: u64)
                     true
                 }
                 Ok(modified) => {
-                    use std::time::{Duration, SystemTime};
                     let threshold = SystemTime::now() - Duration::from_secs(threshold);
                     modified > threshold
                 }
