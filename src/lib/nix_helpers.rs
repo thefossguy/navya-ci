@@ -619,8 +619,6 @@ pub fn find_flake_drvs_to_build(
 
     if nix_drvs_to_build.is_empty() {
         eprintln!("Warning: Could not find any derivations to build for the specified flake");
-    } else {
-        nix_drvs_to_build.sort();
     }
 
     Ok(nix_drvs_to_build)
