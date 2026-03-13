@@ -677,7 +677,7 @@ pub fn create_nix_gc_roots(
         let file_path = file_entry.unwrap().path();
         if file_path.is_symlink()
             && let Some(file_name) = file_path.file_name().and_then(|n| n.to_str())
-            && file_name.starts_with("result-")
+            && file_name.starts_with("result")
         {
             fs::remove_file(&file_path).unwrap();
         }
