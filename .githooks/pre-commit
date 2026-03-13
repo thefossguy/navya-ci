@@ -2,4 +2,4 @@
 set -xeuf -o pipefail
 
 cargo build --quiet
-cargo fmt --quiet --check
+cargo fmt --verbose --check
