@@ -33,6 +33,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &nix_config.nix_copy_machines,
                 nix_config.copy_unsigned_paths,
             );
+            eprintln!(
+                "Notice: All jobs for the current flake state ('{}') are complete",
+                flake_path
+            );
         }
 
         if nix_config.machine_role == MachineRole::QuickCI {
