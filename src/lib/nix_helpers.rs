@@ -659,7 +659,8 @@ fn find_flake_drvs_to_build(
     supported_nix_systems: &[String],
 ) -> Result<HashMap<String, String>, Box<dyn Error>> {
     eprintln!("Notice: Determining the flake derivations to build");
-    let mut nix_derivations_to_build: HashMap<String, String> = HashMap::new();
+    let mut nix_derivations_to_build: HashMap<String, String> =
+        HashMap::with_capacity(flake_outputs_to_build.len());
     for flake_output in flake_outputs_to_build {
         let is_flake_output_arch_dependant =
             is_flake_output_arch_dependant(flake_store_path, flake_output)?;
@@ -743,7 +744,7 @@ fn get_derivations_outpaths(
     max_parallelism: usize,
 ) -> Vec<NixDerivation> {
     eprintln!("Notice: Calculating the `outPath`s of Nix derivations to be built");
-    let mut nix_derivations_struct_object = Vec::new();
+    let mut nix_derivations_struct_object = Vec::with_capacity(nix_derivations_and_systems.len());
 
     for nix_system in supported_nix_systems {
         let mut grouped_drvs: HashMap<String, Vec<String>> = HashMap::new();
@@ -877,7 +878,7 @@ fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> boo
 
 fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation], machine_role: &MachineRole) {
     eprintln!("Notice: Starting Nix build");
-    let mut notices: Vec<String> = Vec::new();
+    let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
     let mut nix_build_common_args: Vec<&str> =
         vec!["build", "--keep-going", "--no-link", "--quiet"];
     if machine_role == &MachineRole::Server {
@@ -951,7 +952,7 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     eprintln!("Notice: Started the Nix build for the QuickCI machine role");
     let mut nix_binary_caches: Vec<String> = Vec::new();
     let mut encountered_uncached_paths = false;
-    let mut notices: Vec<String> = Vec::new();
+    let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
 
     let mut nix_config_show_cmd = create_nix_command();
     nix_config_show_cmd.arg("config").arg("show");
