@@ -958,7 +958,9 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     nix_config_show_cmd.arg("config").arg("show");
     let nix_config_show_cmd_output = nix_config_show_cmd.output();
     match did_command_exit_successfully(&nix_config_show_cmd_output) {
-        false => (),
+        false => {
+            eprintln!("nix config show did not exit successfully");
+        }
         true => {
             let nix_config_show_cmd_output_unwrapped = nix_config_show_cmd_output.unwrap();
             let nix_config_show_cmd_stdout =
@@ -970,7 +972,7 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
                 .filter(|line| line.starts_with("substituters = "))
                 .map(String::from)
                 .collect();
-            if nix_config_show_cmd_stdout.is_empty() {
+            if !nix_config_show_cmd_stdout.is_empty() {
                 let nix_binary_cache_config = nix_config_show_cmd_stdout
                     .split(" = ")
                     .collect::<Vec<&str>>();
