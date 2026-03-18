@@ -1,15 +1,20 @@
-use crate::command_helpers::*;
-use crate::git_helpers::get_pwd_git_toplevel;
+use crate::{
+    command_helpers::*,
+    git_helpers::{get_pwd_git_toplevel, restore_file},
+};
 
-use std::collections::HashMap;
-use std::error::Error;
-use std::fs;
-use std::io::Write;
-use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, SystemTime};
-
-use lexopt;
+use std::{
+    collections::HashMap,
+    env,
+    error::Error,
+    fs,
+    io::Write,
+    path,
+    path::Path,
+    process,
+    process::Command,
+    time::{Duration, SystemTime},
+};
 
 static NIX_SYSTEMS_SUPPORTED_BY_NAVYA_CI: [&str; 5] = [
     "aarch64-linux",
@@ -53,9 +58,19 @@ pub struct NixConfig {
     pub ignore_signing_error: bool,
     pub nix_copy_machines: Vec<String>,
     pub copy_unsigned_paths: bool,
+    pub max_parallelism: usize,
 }
 
-pub fn create_nix_command() -> Command {
+#[derive(Debug, PartialEq, PartialOrd, Eq, Ord)]
+pub struct NixDerivation {
+    pub derivation_attribute: String,
+    pub flake_store_path: String,
+    pub fully_qualified_derivation_path: String,
+    pub derivation_host_platform: String,
+    pub outpath: String,
+}
+
+fn create_nix_command() -> Command {
     let mut nix_command = Command::new("nix");
     nix_command
         .arg("--extra-experimental-features")
@@ -96,12 +111,23 @@ fn print_help() {
 }
 
 pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
-    if std::env::args().count() == 1 {
-        print_help();
-        std::process::exit(1);
+    let meminfo = fs::read_to_string("/proc/meminfo").expect("Could not read /proc/meminfo");
+    let memtotal = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemTotal:"))
+        .and_then(|memtotal_line| memtotal_line.split_whitespace().nth(1))
+        .and_then(|memtotal_kb| memtotal_kb.parse().ok())
+        .unwrap_or(0);
+    if memtotal < 1 {
+        return Err("Could not determine total memory of this host".into());
     }
-    use lexopt::prelude::*;
 
+    if env::args().count() == 1 {
+        print_help();
+        process::exit(1);
+    }
+
+    use lexopt::prelude::*;
     let mut parser = lexopt::Parser::from_env();
 
     let mut flake_outputs_to_build: Vec<String> = Vec::new();
@@ -115,6 +141,8 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
     let mut ignore_signing_error: Option<bool> = None;
     let mut nix_copy_machines: Vec<String> = Vec::new();
     let mut copy_unsigned_paths: bool = false;
+    let total_mem = memtotal / 1024 / 1024;
+    let mut max_parallelism: usize = total_mem / 2;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -154,7 +182,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
             Long("machine-role") => {
                 let specified_machine_role = parser.value()?;
                 let specified_machine_role = specified_machine_role.to_str().unwrap();
-                let valid_machine_role: MachineRole = match specified_machine_role {
+                let valid_machine_role = match specified_machine_role {
                     "node" => MachineRole::Node,
                     "server" => MachineRole::Server,
                     "quick_ci" => MachineRole::QuickCI,
@@ -168,10 +196,13 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
             }
 
             Long("sleep-break") => {
-                let specified_sleep_break: String = parser.value()?.string()?;
-                let sleep_break_u64: u64 = specified_sleep_break.trim().parse().expect(
+                let specified_sleep_break = parser.value()?.string()?;
+                let sleep_break_u64 = specified_sleep_break.trim().parse().expect(
                     "Failed to parse the value of `--sleep-break` from a `String` into a `u64`",
                 );
+                if sleep_break_u64 == 0 {
+                    return Err("--sleep-break cannot be 0".into());
+                }
                 sleep_break = sleep_break_u64;
             }
 
@@ -202,16 +233,23 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
 
             Long("help") => {
                 print_help();
-                std::process::exit(1);
+                process::exit(1);
             }
 
             _ => return Err(arg.unexpected()),
         }
     }
 
+    if max_parallelism < 1 {
+        max_parallelism = 1;
+        eprintln!(
+            "Warning: Either the host does not have enough memory or could not calculate maximum parallelism for whatever reason"
+        );
+    }
+
     let (flake_path_git_toplevel, flake_path_is_git_repo) =
         get_pwd_git_toplevel(&flake_local_reference);
-    let flake_local_reference_unwrapped: String = match flake_local_reference {
+    let flake_local_reference_unwrapped = match flake_local_reference {
         Some(val) => val,
         None => {
             print_help();
@@ -236,7 +274,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
             }
         }
     }
-    let can_write_to_flake_local_reference: bool = match fs::OpenOptions::new()
+    let can_write_to_flake_local_reference = match fs::OpenOptions::new()
         .write(true)
         .open(format!("{}/flake.nix", &flake_local_reference_unwrapped))
     {
@@ -273,13 +311,13 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
                     String::from_utf8_lossy(&nix_config_show_cmd_output_unwrapped.stdout)
                         .trim()
                         .to_string();
-                let nix_config_show_cmd_stdout: String = nix_config_show_cmd_stdout
+                let nix_config_show_cmd_stdout = nix_config_show_cmd_stdout
                     .lines()
                     .filter(|line| {
                         line.starts_with("system = ") || line.starts_with("extra-platforms = ")
                     })
                     .map(String::from)
-                    .collect();
+                    .collect::<String>();
                 match nix_config_show_cmd_stdout.is_empty() {
                     true => {
                         return Err(
@@ -313,7 +351,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
         );
     }
 
-    let machine_role: MachineRole = match machine_role {
+    let machine_role = match machine_role {
         Some(val) => val,
         None => {
             print_help();
@@ -324,18 +362,17 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
         }
     };
 
-    let (signing_key_path, ignore_signing_error): (String, bool) =
-        match (signing_key_path, ignore_signing_error) {
-            // No signing key specified, ignore signing errors
-            (None, None) => ("".to_string(), true),
-            (Some(key), Some(val)) => (key, val),
-            (Some(val), None) => (val, false),
-            (None, Some(_)) => {
-                return Err(
-                    "--ignore-signing-error was specified but no signing key was specified".into(),
-                );
-            }
-        };
+    let (signing_key_path, ignore_signing_error) = match (signing_key_path, ignore_signing_error) {
+        // No signing key specified, ignore signing errors
+        (None, None) => ("".to_string(), true),
+        (Some(key), Some(val)) => (key, val),
+        (Some(val), None) => (val, false),
+        (None, Some(_)) => {
+            return Err(
+                "--ignore-signing-error was specified but no signing key was specified".into(),
+            );
+        }
+    };
 
     Ok(NixConfig {
         flake_outputs_to_build,
@@ -349,23 +386,13 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
         ignore_signing_error,
         nix_copy_machines,
         copy_unsigned_paths,
+        max_parallelism,
     })
 }
 
-pub fn restore_lockfile(nix_config: &NixConfig) -> bool {
-    let mut git_restore_cmd = Command::new("git");
-    git_restore_cmd
-        .arg("-C")
-        .arg(nix_config.flake_local_reference.clone())
-        .arg("restore")
-        .arg("--")
-        .arg("flake.lock");
-    let git_restore_cmd_output = git_restore_cmd.output();
-    did_command_exit_successfully(&git_restore_cmd_output)
-}
-
-fn was_lockfile_updated_in_last_sleep_break(lockfile_path: &str, threshold: u64) -> bool {
-    let metadata = std::fs::metadata(lockfile_path);
+fn was_lockfile_updated_in_last_sleep_break(flake_local_reference: &str, threshold: u64) -> bool {
+    let lockfile_path = format!("{}/flake.lock", flake_local_reference);
+    let metadata = fs::metadata(lockfile_path);
     match metadata {
         Err(_) => {
             eprintln!(
@@ -393,49 +420,75 @@ fn was_lockfile_updated_in_last_sleep_break(lockfile_path: &str, threshold: u64)
     }
 }
 
-pub fn perform_nix_flake_update(nix_config: &NixConfig) -> bool {
-    match nix_config.update_lockfile {
-        false => true,
-        true => {
-            let lockfile_path = format!("{}/flake.lock", nix_config.flake_local_reference);
-            match was_lockfile_updated_in_last_sleep_break(&lockfile_path, nix_config.sleep_break) {
-                true => {
-                    eprintln!(
-                        "Notice: It appears that the lockfile was updated in the last {} seconds, skipping a lockfile update to be under any GitHub API rate limit(s)",
-                        nix_config.sleep_break
-                    );
-                    true
-                }
-                false => {
-                    let mut nix_flake_update_cmd = create_nix_command();
-                    nix_flake_update_cmd
-                        .arg("flake")
-                        .arg("update")
-                        .current_dir(nix_config.flake_local_reference.clone());
-                    if std::env::var("GITHUB_TOKEN").is_ok() {
-                        eprintln!("Notice: Using the `GITHUB_TOKEN` to update the lockfile");
-                        let github_token: String = std::env::var("GITHUB_TOKEN").unwrap();
-                        nix_flake_update_cmd.env(
-                            "NIX_CONFIG",
-                            format!("access-tokens = github.com={}", github_token),
-                        );
-                    }
-                    let nix_flake_update_cmd_output = nix_flake_update_cmd.output();
-                    did_command_exit_successfully(&nix_flake_update_cmd_output)
-                }
+fn perform_nix_flake_update_unwrapped(flake_local_reference: &str) -> bool {
+    let mut nix_flake_update_cmd = create_nix_command();
+    nix_flake_update_cmd
+        .arg("flake")
+        .arg("update")
+        .current_dir(flake_local_reference);
+
+    if let Ok(github_token_val) = env::var("GITHUB_TOKEN") {
+        eprintln!("Notice: Using the `GITHUB_TOKEN` to update the lockfile");
+        nix_flake_update_cmd.env(
+            "NIX_CONFIG",
+            format!("access-tokens = github.com={}", github_token_val),
+        );
+    }
+
+    let nix_flake_update_cmd_output = nix_flake_update_cmd.output();
+    did_command_exit_successfully(&nix_flake_update_cmd_output)
+}
+
+pub fn perform_nix_flake_update(nix_config: &NixConfig) -> Result<(), Box<dyn Error>> {
+    if nix_config.update_lockfile {
+        match was_lockfile_updated_in_last_sleep_break(
+            &nix_config.flake_local_reference,
+            nix_config.sleep_break,
+        ) {
+            true => {
+                eprintln!(
+                    "Notice: It appears that the lockfile was updated in the last {} seconds, skipping a lockfile update to be under any GitHub API rate limit(s)",
+                    nix_config.sleep_break
+                );
+                Ok(())
             }
+            false => match perform_nix_flake_update_unwrapped(&nix_config.flake_local_reference) {
+                true => Ok(()),
+                false => {
+                    eprintln!(
+                        "Warning: Encountered an error updating the lockfile of the specified flake, restoring the lockfile and retrying it once again"
+                    );
+                    match restore_file(&nix_config.flake_local_reference, "flake.lock") {
+                        false => {
+                            Err("Could not restore the lockfile of the specified flake".into())
+                        }
+                        true => {
+                            match perform_nix_flake_update_unwrapped(
+                                &nix_config.flake_local_reference,
+                            ) {
+                                true => Ok(()),
+                                false => {
+                                    Err("Could not update the lockfile of the specified flake"
+                                        .into())
+                                }
+                            }
+                        }
+                    }
+                }
+            },
         }
+    } else {
+        Ok(())
     }
 }
 
-pub fn perform_nix_flake_archive(nix_config: &NixConfig) -> Result<String, Box<dyn Error>> {
+pub fn perform_nix_flake_archive(flake_local_reference: &str) -> Result<String, Box<dyn Error>> {
     let mut nix_flake_archive_cmd = create_nix_command();
     nix_flake_archive_cmd
         .arg("flake")
         .arg("archive")
         .arg("--json")
-        .arg("--pretty")
-        .current_dir(nix_config.flake_local_reference.clone());
+        .current_dir(flake_local_reference);
     let nix_flake_archive_cmd_output = nix_flake_archive_cmd.output();
     match did_command_exit_successfully(&nix_flake_archive_cmd_output) {
         true => {
@@ -444,21 +497,22 @@ pub fn perform_nix_flake_archive(nix_config: &NixConfig) -> Result<String, Box<d
                 String::from_utf8_lossy(&nix_flake_archive_cmd_output_unwrapped.stdout)
                     .trim()
                     .to_string();
+            let nix_flake_archive_cmd_jsonobj =
+                nojson::RawJson::parse(&nix_flake_archive_cmd_stdout).unwrap_or_else(|_| {
+                    panic!(
+                        "Could not parse the JSON string ('{}')",
+                        nix_flake_archive_cmd_stdout
+                    )
+                });
+            let flake_store_path: String = nix_flake_archive_cmd_jsonobj
+                .value()
+                .to_path_member(&["path"])?
+                .required()
+                .expect("Could not determine the store path of the flake")
+                .try_into()?;
 
-            let unformatted_flake_store_path: String = nix_flake_archive_cmd_stdout
-                .lines()
-                .filter(|line| {
-                    line.starts_with("  \"path\": \"/nix/store/")
-                        && (line.ends_with("-source\"") || line.ends_with("-source\","))
-                })
-                .map(String::from)
-                .collect();
-            match unformatted_flake_store_path.is_empty() {
-                false => Ok(unformatted_flake_store_path
-                    .chars()
-                    .skip(11)
-                    .take(50)
-                    .collect()),
+            match flake_store_path.is_empty() {
+                false => Ok(flake_store_path),
                 true => Err("Could not determine the store path of the flake".into()),
             }
         }
@@ -466,7 +520,18 @@ pub fn perform_nix_flake_archive(nix_config: &NixConfig) -> Result<String, Box<d
     }
 }
 
-pub fn find_flake_toplevel_outputs(
+fn create_tmp_file() -> Result<(fs::File, path::PathBuf), Box<dyn Error>> {
+    let mut path = env::temp_dir();
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    path.push(format!("nix-expr-{}-{}", process::id(), unique));
+    let file = fs::File::create(&path)?;
+    Ok((file, path))
+}
+
+fn get_flake_toplevel_outputs(
     flake_store_path: &str,
     flake_outputs_to_find: &[String],
     ignore_missing_flake_outputs: bool,
@@ -474,18 +539,32 @@ pub fn find_flake_toplevel_outputs(
     eprintln!(
         "Notice: Checking if specified flake outputs to build are present in the `<flake>.outputs`"
     );
+    let nix_expr_string = format!(
+        "let flake = builtins.getFlake \"{}\"; in builtins.attrNames flake.outputs",
+        flake_store_path
+    );
+    let (mut nix_expr_file, nix_expr_path) = create_tmp_file().unwrap_or_else(|_| {
+        panic!(
+            "Could not create a temp file to store the Nix expression '{}'",
+            nix_expr_string
+        )
+    });
+    nix_expr_file
+        .write_all(nix_expr_string.as_bytes())
+        .unwrap_or_else(|_| panic!("Could not write to temp file '{}'", nix_expr_path.display()));
+
     let mut nix_eval_cmd = create_nix_command();
     nix_eval_cmd
         .arg("eval")
+        .arg("--option")
+        .arg("eval-cache")
+        .arg("true")
         .arg("--json")
         .arg("--pretty")
-        .arg("--impure")
-        .arg("--expr")
-        .arg(format!(
-            "builtins.attrNames (builtins.getFlake \"path:{}\").outputs",
-            flake_store_path
-        ));
+        .arg("--file")
+        .arg(&nix_expr_path);
     let nix_eval_cmd_output = nix_eval_cmd.output();
+    let _ = fs::remove_file(&nix_expr_path);
     match did_command_exit_successfully(&nix_eval_cmd_output) {
         false => Err("Could not find the toplevel outputs of the specified flake".into()),
         true => {
@@ -512,7 +591,7 @@ pub fn find_flake_toplevel_outputs(
             match flake_outputs_missing.is_empty() {
                 true => Ok(flake_outputs_found),
                 false => {
-                    let missing_outputs_message: String = format!(
+                    let missing_outputs_message = format!(
                         "Of the specified flake outputs to build, these are missing: '{}'",
                         flake_outputs_missing.join("' '")
                     );
@@ -535,6 +614,9 @@ fn is_flake_output_arch_dependant(
     let mut nix_eval_cmd = create_nix_command();
     nix_eval_cmd
         .arg("eval")
+        .arg("--option")
+        .arg("eval-cache")
+        .arg("true")
         .arg("--json")
         .arg("--apply")
         .arg("builtins.attrNames")
@@ -555,28 +637,46 @@ fn is_flake_output_arch_dependant(
     }
 }
 
-pub fn find_flake_drvs_to_build(
+fn build_nix_derivation_struct_object(
+    derivation_attribute: String,
+    evaluated_outpath: String,
+    flake_store_path: String,
+    derivation_host_platform: String,
+) -> NixDerivation {
+    let fully_qualified_derivation_path = format!("{}#{}", flake_store_path, derivation_attribute);
+    NixDerivation {
+        derivation_attribute,
+        flake_store_path,
+        fully_qualified_derivation_path,
+        derivation_host_platform,
+        outpath: evaluated_outpath,
+    }
+}
+
+fn find_flake_drvs_to_build(
     flake_store_path: &str,
     flake_outputs_to_build: &[String],
     supported_nix_systems: &[String],
-) -> Result<Vec<String>, Box<dyn Error>> {
+) -> Result<HashMap<String, String>, Box<dyn Error>> {
     eprintln!("Notice: Determining the flake derivations to build");
-    let mut nix_drvs_to_build: Vec<String> = Vec::new();
-    for flake_output in flake_outputs_to_build.iter() {
-        let is_flake_output_arch_dependant: bool =
+    let mut nix_derivations_to_build: HashMap<String, String> = HashMap::new();
+    for flake_output in flake_outputs_to_build {
+        let is_flake_output_arch_dependant =
             is_flake_output_arch_dependant(flake_store_path, flake_output)?;
         let mut nix_eval_cmd = create_nix_command();
         nix_eval_cmd
             .arg("eval")
+            .arg("--option")
+            .arg("eval-cache")
+            .arg("true")
             .arg(format!("{}#{}", flake_store_path, flake_output))
+            .arg("--json")
             .arg("--apply");
-
         if is_flake_output_arch_dependant {
-            nix_eval_cmd.arg(format!("{}: let prefixes = system: builtins.map (name: \"${{system}}.${{name}}\") (builtins.attrNames {}.${{system}}); systems = [\"{}\"]; in builtins.concatLists (builtins.map prefixes systems)", flake_output, flake_output, supported_nix_systems.join("\" \"")));
+            nix_eval_cmd.arg(format!("output: let systems = [ \"{}\" ]; in builtins.foldl' (acc: system: acc // {{ ${{system}} = builtins.attrNames output.${{system}}; }}) {{}} systems", supported_nix_systems.join("\" \"")));
         } else {
-            nix_eval_cmd.arg(format!("configs: let wantedSystems = [ \"{}\" ]; in builtins.filter (n: builtins.elem configs.${{n}}.config.nixpkgs.hostPlatform.system wantedSystems) (builtins.attrNames configs)", supported_nix_systems.join("\" \"")));
+            nix_eval_cmd.arg(format!("configs: let wantedSystems = [ \"{}\" ]; filtered = builtins.filter (n: builtins.elem configs.${{n}}.config.nixpkgs.hostPlatform.system wantedSystems) (builtins.attrNames configs); in builtins.foldl' (acc: n: let arch = configs.${{n}}.config.nixpkgs.hostPlatform.system; in acc // {{ ${{arch}} = (acc.${{arch}} or []) ++ [n]; }}) {{}} filtered", supported_nix_systems.join("\" \"")));
         }
-
         let nix_eval_cmd_output = nix_eval_cmd.output();
         match did_command_exit_successfully(&nix_eval_cmd_output) {
             false => {
@@ -592,12 +692,16 @@ pub fn find_flake_drvs_to_build(
                     String::from_utf8_lossy(&nix_eval_cmd_output_unwrapped.stdout)
                         .trim()
                         .to_string();
-                let nix_eval_cmd_stdout = nix_eval_cmd_stdout
-                    .replace("[", "")
-                    .replace("]", "")
-                    .replace('"', "");
-                for nix_drv in nix_eval_cmd_stdout.split(" ") {
-                    if !nix_drv.is_empty() {
+                let nix_eval_cmd_jsonobj = nojson::RawJson::parse(&nix_eval_cmd_stdout)
+                    .unwrap_or_else(|_| {
+                        panic!(
+                            "Could not parse the JSON string ('{}')",
+                            nix_eval_cmd_stdout
+                        )
+                    });
+                let nix_eval_cmd_jsonobj = nix_eval_cmd_jsonobj.value().to_object()?;
+                for (derivation_host_platform, drv_attrs) in nix_eval_cmd_jsonobj {
+                    for derivation in drv_attrs.to_array()? {
                         let mut suffix = "";
                         match flake_output.as_str() {
                             "apps" => suffix = ".program",
@@ -608,141 +712,224 @@ pub fn find_flake_drvs_to_build(
                             "nixosConfigurations" => suffix = ".config.system.build.toplevel",
                             _ => (),
                         }
-                        let fully_qualified_drv_path =
-                            format!("{}.{}{}", flake_output, nix_drv, suffix);
-                        nix_drvs_to_build.push(fully_qualified_drv_path);
+                        let derivation_host_platform =
+                            derivation_host_platform.as_string_str()?.to_string();
+                        let nix_system_str = if is_flake_output_arch_dependant {
+                            format!(".{}", derivation_host_platform)
+                        } else {
+                            "".to_string()
+                        };
+                        let derivation_attribute = format!(
+                            "{}{}.{}{}",
+                            flake_output,
+                            nix_system_str,
+                            derivation.as_string_str()?,
+                            suffix
+                        );
+                        nix_derivations_to_build
+                            .insert(derivation_attribute, derivation_host_platform);
+                    }
+                }
+            }
+        }
+    }
+    Ok(nix_derivations_to_build)
+}
+
+fn get_derivations_outpaths(
+    nix_derivations_and_systems: &HashMap<String, String>,
+    supported_nix_systems: &[String],
+    flake_store_path: &str,
+    max_parallelism: usize,
+) -> Vec<NixDerivation> {
+    eprintln!("Notice: Calculating the `outPath`s of Nix derivations to be built");
+    let mut nix_derivations_struct_object = Vec::new();
+
+    for nix_system in supported_nix_systems {
+        let mut grouped_drvs: HashMap<String, Vec<String>> = HashMap::new();
+        let nix_derivations_list = nix_derivations_and_systems
+            .iter()
+            .filter(|(_, nix_sys)| *nix_sys == nix_system)
+            .map(|(ze_drv, _)| ze_drv.clone())
+            .collect::<Vec<String>>();
+        for drv in &nix_derivations_list {
+            let toplevel = drv.split(".").next().unwrap();
+            grouped_drvs
+                .entry(toplevel.to_string())
+                .or_default()
+                .push(drv.to_string());
+        }
+
+        for derivation_group in grouped_drvs.values() {
+            let derivation_chunks = derivation_group
+                .chunks(max_parallelism)
+                .map(|chunk| chunk.to_vec())
+                .collect::<Vec<Vec<String>>>();
+            for derivations in derivation_chunks {
+                if !derivations.is_empty() {
+                    let derivation_expr = derivations
+                        .iter()
+                        .map(|indv_drv| format!("\"{}\" = flake.{};", indv_drv, indv_drv))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let eval_string = format!(
+                        "let flake = builtins.getFlake \"{}\"; in {{ {} }}",
+                        flake_store_path, derivation_expr
+                    );
+                    let (mut nix_expr_file, nix_expr_path) =
+                        create_tmp_file().unwrap_or_else(|_| {
+                            panic!(
+                                "Could not create a temp file to store the Nix expression '{}'",
+                                eval_string
+                            )
+                        });
+                    nix_expr_file
+                        .write_all(eval_string.as_bytes())
+                        .unwrap_or_else(|_| {
+                            panic!("Could not write to temp file '{}'", nix_expr_path.display())
+                        });
+
+                    let mut nix_eval_cmd = create_nix_command();
+                    nix_eval_cmd
+                        .arg("eval")
+                        .arg("--option")
+                        .arg("eval-cache")
+                        .arg("true")
+                        .arg("--json")
+                        .arg("--option")
+                        .arg("eval-system")
+                        .arg(nix_system)
+                        .arg("--file")
+                        .arg(&nix_expr_path);
+                    let nix_eval_cmd_output = nix_eval_cmd.output();
+                    let _ = fs::remove_file(&nix_expr_path);
+                    match did_command_exit_successfully(&nix_eval_cmd_output) {
+                        false => {
+                            eprintln!(
+                                "Warning: Could not evaluate outPaths of these Nix attributes: '{:?}'",
+                                derivations
+                            )
+                        }
+                        true => {
+                            let nix_eval_cmd_output_unwrapped = nix_eval_cmd_output.unwrap();
+                            let nix_eval_cmd_stdout =
+                                String::from_utf8_lossy(&nix_eval_cmd_output_unwrapped.stdout)
+                                    .trim()
+                                    .to_string();
+                            let nix_eval_cmd_stdout_jsonobj: nojson::Json<HashMap<String, String>> =
+                                nix_eval_cmd_stdout.parse().unwrap_or_else(|_| {
+                                    panic!(
+                                        "Could not parse the JSON string ('{}')",
+                                        nix_eval_cmd_stdout
+                                    )
+                                });
+                            for (evaluated_nix_derivation, evaluated_outpath) in
+                                nix_eval_cmd_stdout_jsonobj.0.iter()
+                            {
+                                let nix_derivation_struct_obj = build_nix_derivation_struct_object(
+                                    evaluated_nix_derivation.to_string(),
+                                    evaluated_outpath.to_string(),
+                                    flake_store_path.to_string(),
+                                    nix_system.to_string(),
+                                );
+                                nix_derivations_struct_object.push(nix_derivation_struct_obj);
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
-    if nix_drvs_to_build.is_empty() {
-        eprintln!("Warning: Could not find any derivations to build for the specified flake");
-    }
-
-    Ok(nix_drvs_to_build)
+    nix_derivations_struct_object.sort();
+    nix_derivations_struct_object
 }
 
-fn get_drv_outpath(flake_drv_fqdn: &str) -> String {
-    let mut nix_eval_command = create_nix_command();
-    nix_eval_command
-        .arg("eval")
-        .arg("--option")
-        .arg("eval-cache")
-        .arg("true")
-        .arg("--raw");
-    if flake_drv_fqdn.contains("-source#apps.") {
-        nix_eval_command.arg(flake_drv_fqdn);
-    } else {
-        nix_eval_command.arg(format!("{}.outPath", flake_drv_fqdn));
-    }
+pub fn get_nix_derivations_to_build(
+    nix_config: &NixConfig,
+    flake_store_path: &str,
+) -> Result<Vec<NixDerivation>, Box<dyn Error>> {
+    let flake_toplevel_outputs_discovered = get_flake_toplevel_outputs(
+        flake_store_path,
+        &nix_config.flake_outputs_to_build,
+        nix_config.ignore_missing_flake_outputs,
+    )?;
+    let nix_derivations_and_systems = find_flake_drvs_to_build(
+        flake_store_path,
+        &flake_toplevel_outputs_discovered,
+        &nix_config.nix_systems,
+    )?;
+    let nix_derivations_to_build = get_derivations_outpaths(
+        &nix_derivations_and_systems,
+        &nix_config.nix_systems,
+        flake_store_path,
+        nix_config.max_parallelism,
+    );
 
-    let nix_eval_command_output = nix_eval_command.output();
-    match did_command_exit_successfully(&nix_eval_command_output) {
-        false => "".to_string(),
-        true => {
-            let nix_eval_command_output_unwrapped = nix_eval_command_output.unwrap();
-            String::from_utf8_lossy(&nix_eval_command_output_unwrapped.stdout)
-                .trim()
-                .to_string()
-        }
-    }
+    Ok(nix_derivations_to_build)
 }
 
-pub fn get_flake_drvs_outpaths(flake_drvs_to_build: &[String]) -> HashMap<String, String> {
-    eprintln!("Notice: Calculating the `outPath`s of Nix derivations to be built");
-    let mut flake_atttrs_and_outpaths: HashMap<String, String> =
-        HashMap::with_capacity(flake_drvs_to_build.len());
-    for (counter, flake_drv) in (0..flake_drvs_to_build.len())
-        .rev()
-        .zip(flake_drvs_to_build.iter())
-    {
-        eprintln!("{}..", counter);
-        let outpath = get_drv_outpath(flake_drv);
-        flake_atttrs_and_outpaths.insert(flake_drv.to_string(), outpath);
-    }
-    std::io::stdout().flush().unwrap();
-    flake_atttrs_and_outpaths
-}
-
-pub fn create_nix_gc_roots(
-    flake_drvs_and_outpaths: &HashMap<String, String>,
-    flake_local_reference: &str,
-) {
-    assert!(flake_drvs_and_outpaths.len() < 1000);
-    for file_entry in fs::read_dir(flake_local_reference).unwrap() {
-        let file_path = file_entry.unwrap().path();
-        if file_path.is_symlink()
-            && let Some(file_name) = file_path.file_name().and_then(|n| n.to_str())
-            && file_name.starts_with("result")
-        {
-            fs::remove_file(&file_path).unwrap();
-        }
-    }
-    for (counter, nix_store_path) in (0_u16..).zip(flake_drvs_and_outpaths.values()) {
-        let out_link = format!("{}/result-{:03}", flake_local_reference, counter);
-        if Path::new(&out_link).exists() {
-            let _ = std::fs::remove_file(&out_link);
-        }
-        if Path::new(nix_store_path).exists() {
-            let mut nix_build_cmd = create_nix_command();
-            nix_build_cmd
-                .arg("build")
-                .arg(nix_store_path)
-                .arg("--out-link")
-                .arg(out_link);
-            let _ = nix_build_cmd.output();
-        }
-    }
-}
-
-fn do_single_drv_nix_build(nix_drv: &str, common_nix_build_args: &[&str]) -> bool {
+fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> bool {
     let mut nix_build_cmd = create_nix_command();
-    nix_build_cmd.args(common_nix_build_args).arg(nix_drv);
-    let nix_build_cmd_output = nix_build_cmd.output();
-    did_command_exit_successfully(&nix_build_cmd_output)
+    nix_build_cmd.args(nix_build_common_args).arg(nix_drv);
+    did_command_exit_successfully(&nix_build_cmd.output())
 }
 
-pub fn do_nix_build_node(flake_drvs_and_outpaths: &HashMap<String, String>) {
+fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation], machine_role: &MachineRole) {
     eprintln!("Notice: Starting Nix build");
-    let mut notice_messages: Vec<String> = Vec::with_capacity(flake_drvs_and_outpaths.len());
-    let common_nix_build_args: Vec<&str> = vec!["build", "--keep-going", "--no-link", "--quiet"];
+    let mut notices: Vec<String> = Vec::new();
+    let mut nix_build_common_args: Vec<&str> =
+        vec!["build", "--keep-going", "--no-link", "--quiet"];
+    if machine_role == &MachineRole::Server {
+        nix_build_common_args.push("--max-jobs");
+        nix_build_common_args.push("0");
+    }
     let mut nix_build_cmd = create_nix_command();
-    nix_build_cmd
-        .args(common_nix_build_args.clone())
-        .args(flake_drvs_and_outpaths.keys());
+    nix_build_cmd.args(&nix_build_common_args);
+    nix_build_cmd.args(
+        nix_derivations_to_build
+            .iter()
+            .map(|nix_drv| nix_drv.fully_qualified_derivation_path.clone())
+            .collect::<Vec<String>>(),
+    );
     let nix_build_cmd_output = nix_build_cmd.output();
-
     match did_command_exit_successfully(&nix_build_cmd_output) {
         true => {
-            for (nix_drv, drv_outpath) in flake_drvs_and_outpaths.iter() {
-                notice_messages.push(format!(
-                    "Notice: Successful build: {} ---> {}",
-                    nix_drv, drv_outpath
-                ));
-            }
+            notices.extend(
+                nix_derivations_to_build
+                    .iter()
+                    .map(|drv_struct| {
+                        format!(
+                            "Notice: Successful build: {} ---> {}",
+                            drv_struct.fully_qualified_derivation_path, drv_struct.outpath
+                        )
+                    })
+                    .collect::<Vec<String>>(),
+            );
         }
         false => {
-            for (nix_drv, drv_outpath) in flake_drvs_and_outpaths.iter() {
-                match do_single_drv_nix_build(nix_drv, &common_nix_build_args) {
-                    true => notice_messages.push(format!(
+            for nix_drv_struct in nix_derivations_to_build {
+                match do_single_drv_nix_build(
+                    &nix_drv_struct.fully_qualified_derivation_path,
+                    &nix_build_common_args,
+                ) {
+                    true => notices.push(format!(
                         "Notice: Successful build: {} ---> {}",
-                        nix_drv, drv_outpath
+                        nix_drv_struct.fully_qualified_derivation_path, nix_drv_struct.outpath
                     )),
-                    false => notice_messages.push(format!(
+                    false => notices.push(format!(
                         "Notice: Unsuccessful build: {} -x-> {}",
-                        nix_drv, drv_outpath
+                        nix_drv_struct.fully_qualified_derivation_path, nix_drv_struct.outpath
                     )),
                 }
             }
         }
     }
-    notice_messages.sort();
-    eprintln!("{}", notice_messages.join("\n"));
+    notices.sort();
+    eprintln!("{}", notices.join("\n"));
 }
 
-fn is_store_path_cached(store_path: &str, nix_caches: &[String]) -> bool {
+fn is_drv_store_path_cached(drv_store_path: &str, nix_caches: &[String]) -> bool {
     let mut encountered_path_in_cache: bool = false;
     for remote_store in nix_caches {
         let mut nix_path_info_cmd = create_nix_command();
@@ -751,7 +938,7 @@ fn is_store_path_cached(store_path: &str, nix_caches: &[String]) -> bool {
             .arg("--refresh")
             .arg("--store")
             .arg(remote_store)
-            .arg(store_path);
+            .arg(drv_store_path);
         if did_command_exit_successfully(&nix_path_info_cmd.output()) {
             encountered_path_in_cache = true;
             break;
@@ -760,9 +947,12 @@ fn is_store_path_cached(store_path: &str, nix_caches: &[String]) -> bool {
     encountered_path_in_cache
 }
 
-pub fn do_nix_build_quick_ci(flake_drvs_and_outpaths: &HashMap<String, String>) {
+fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     eprintln!("Notice: Started the Nix build for the QuickCI machine role");
     let mut nix_binary_caches: Vec<String> = Vec::new();
+    let mut encountered_uncached_paths = false;
+    let mut notices: Vec<String> = Vec::new();
+
     let mut nix_config_show_cmd = create_nix_command();
     nix_config_show_cmd.arg("config").arg("show");
     let nix_config_show_cmd_output = nix_config_show_cmd.output();
@@ -779,14 +969,14 @@ pub fn do_nix_build_quick_ci(flake_drvs_and_outpaths: &HashMap<String, String>) 
                 .filter(|line| line.starts_with("substituters = "))
                 .map(String::from)
                 .collect();
-            if !nix_config_show_cmd_stdout.is_empty() {
-                let nix_binary_cache_config: Vec<&str> =
-                    nix_config_show_cmd_stdout.split(" = ").collect();
-                let nix_binary_caches_string: String =
-                    nix_binary_cache_config.get(1).unwrap().to_string();
-                nix_binary_caches = nix_binary_caches_string
+            if nix_config_show_cmd_stdout.is_empty() {
+                let nix_binary_cache_config = nix_config_show_cmd_stdout
+                    .split(" = ")
+                    .collect::<Vec<&str>>();
+                let nix_binary_cache_string = nix_binary_cache_config.get(1).unwrap().to_string();
+                nix_binary_caches = nix_binary_cache_string
                     .split(" ")
-                    .map(|v| v.trim().to_string())
+                    .map(|cache| cache.trim().to_string())
                     .collect();
             }
         }
@@ -794,81 +984,117 @@ pub fn do_nix_build_quick_ci(flake_drvs_and_outpaths: &HashMap<String, String>) 
 
     if nix_binary_caches.is_empty() {
         println!("Error: Could not determine configured Nix binary caches");
-        std::process::exit(1);
+        process::exit(1);
     } else {
-        let mut notices: Vec<String> = Vec::new();
-        let mut encountered_uncached_paths = false;
-        for (nix_drv, drv_outpath) in flake_drvs_and_outpaths.iter() {
-            let nix_attr: String = nix_drv.chars().skip(51).take(nix_drv.len() - 51).collect();
-            match is_store_path_cached(drv_outpath, &nix_binary_caches) {
-                false => {
+        for nix_drv_struct in nix_derivations_to_build {
+            match is_drv_store_path_cached(&nix_drv_struct.outpath, &nix_binary_caches) {
+                true => {
                     notices.push(format!(
-                        "Warning: The Nix attribute '{}' is NOT cached ('{}')",
-                        nix_attr, drv_outpath
+                        "Notice: The Nix attribute '{}' is cached ('{}')",
+                        nix_drv_struct.derivation_attribute, nix_drv_struct.outpath
                     ));
-                    encountered_uncached_paths = true;
                 }
-                true => notices.push(format!(
-                    "Notice: The Nix attribute '{}' is cached ('{}')",
-                    nix_attr, drv_outpath
-                )),
+                false => {
+                    encountered_uncached_paths = true;
+                    notices.push(format!(
+                        "Notice: The Nix attribute '{}' is NOT cached ('{}')",
+                        nix_drv_struct.derivation_attribute, nix_drv_struct.outpath
+                    ));
+                }
             }
         }
-        notices.sort();
-        eprintln!("{}", notices.join("\n"));
+    }
 
-        if encountered_uncached_paths {
-            println!("Encountered uncached path(s)");
-            std::process::exit(1);
-        }
+    notices.sort();
+    eprintln!("{}", notices.join("\n"));
+
+    if encountered_uncached_paths {
+        println!("Encountered uncached path(s)");
+        process::exit(1);
     }
 }
 
-pub fn do_nix_build(flake_drvs_and_outpaths: &HashMap<String, String>, machine_role: &MachineRole) {
+pub fn do_nix_build(nix_derivations_to_build: &[NixDerivation], machine_role: &MachineRole) {
     match machine_role {
-        MachineRole::Node => do_nix_build_node(flake_drvs_and_outpaths),
-        MachineRole::Server => (),
-        MachineRole::QuickCI => do_nix_build_quick_ci(flake_drvs_and_outpaths),
+        MachineRole::Node => do_nix_build_unwrapped(nix_derivations_to_build, machine_role),
+        MachineRole::Server => do_nix_build_unwrapped(nix_derivations_to_build, machine_role),
+        MachineRole::QuickCI => do_nix_build_quick_ci(nix_derivations_to_build),
+    }
+}
+
+pub fn create_nix_gc_roots(
+    nix_derivations_to_build: &[NixDerivation],
+    flake_local_reference: &str,
+) {
+    assert!(nix_derivations_to_build.len() < 1000);
+    for file_entry in fs::read_dir(flake_local_reference).unwrap() {
+        let file_path = file_entry.unwrap().path();
+        if file_path.is_symlink()
+            && let Some(file_name) = file_path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with("result")
+        {
+            fs::remove_file(&file_path).unwrap();
+        }
+    }
+
+    for (counter, nix_drv_struct) in (0_u16..).zip(nix_derivations_to_build) {
+        let out_link = format!("{}/result-{:03}", flake_local_reference, counter);
+        if Path::new(&out_link).exists() {
+            let _ = fs::remove_file(&out_link);
+        }
+        if Path::new(&nix_drv_struct.outpath).exists() {
+            let mut nix_build_cmd = create_nix_command();
+            nix_build_cmd
+                .arg("build")
+                .arg(&nix_drv_struct.outpath)
+                .arg("--out-link")
+                .arg(out_link);
+            let _ = nix_build_cmd.output();
+        } else {
+            let out_link = format!("{}-missing", out_link);
+            let _ = std::os::unix::fs::symlink(
+                format!("/missing{}", &nix_drv_struct.outpath),
+                out_link,
+            );
+        }
     }
 }
 
 pub fn do_nix_sign(
-    flake_drvs_and_outpaths: &HashMap<String, String>,
+    nix_derivations_to_build: &[NixDerivation],
     signing_key_path: &str,
     ignore_signing_error: bool,
 ) -> Result<(), Box<dyn Error>> {
-    match Path::new(signing_key_path).exists() {
-        false => Ok(()),
-        true => {
-            eprintln!("Notice: Signing built paths using specified key");
-            let mut nix_store_sign_cmd = create_nix_command();
-            nix_store_sign_cmd
-                .arg("store")
-                .arg("sign")
-                .arg("--key-file")
-                .arg(signing_key_path);
-            for drv_store_path in flake_drvs_and_outpaths.values() {
-                if Path::new(drv_store_path).exists() {
-                    nix_store_sign_cmd.arg(drv_store_path);
-                }
-            }
-            let nix_store_sign_cmd_output = nix_store_sign_cmd.output();
-            match did_command_exit_successfully(&nix_store_sign_cmd_output) {
-                true => Ok(()),
-                false => match ignore_signing_error {
-                    true => {
-                        eprintln!("Warning: Signing store paths failed, ignoring the error");
-                        Ok(())
-                    }
-                    false => Err("Signing store paths failed".into()),
-                },
-            }
+    eprintln!("Notice: Signing built paths using specified key");
+
+    let mut nix_store_sign_cmd = create_nix_command();
+    nix_store_sign_cmd
+        .arg("store")
+        .arg("sign")
+        .arg("--recursive")
+        .arg("--key-file")
+        .arg(signing_key_path);
+    for nix_drv_struct in nix_derivations_to_build {
+        if Path::new(&nix_drv_struct.outpath).exists() {
+            nix_store_sign_cmd.arg(&nix_drv_struct.outpath);
         }
+    }
+    let nix_store_sign_cmd_output = nix_store_sign_cmd.output();
+
+    match did_command_exit_successfully(&nix_store_sign_cmd_output) {
+        true => Ok(()),
+        false => match ignore_signing_error {
+            true => {
+                eprintln!("Warning: Signing store paths failed, ignoring the error");
+                Ok(())
+            }
+            false => Err("Signing store paths failed".into()),
+        },
     }
 }
 
 pub fn do_nix_copy(
-    flake_drvs_and_outpaths: &HashMap<String, String>,
+    nix_derivations_to_build: &[NixDerivation],
     machine_role: &MachineRole,
     nix_copy_machines: &[String],
     copy_unsigned_paths: bool,
@@ -876,6 +1102,7 @@ pub fn do_nix_copy(
     if machine_role == &MachineRole::QuickCI || nix_copy_machines.is_empty() {
         return;
     }
+
     eprintln!("Notice: Copying built paths to specified remote(s)");
     for machine_uri in nix_copy_machines {
         let mut nix_copy_cmd = create_nix_command();
@@ -887,16 +1114,27 @@ pub fn do_nix_copy(
         if copy_unsigned_paths {
             nix_copy_cmd.arg("--no-check-sigs");
         }
-        for drv_outpath in flake_drvs_and_outpaths.values() {
-            if Path::new(drv_outpath).exists() {
-                nix_copy_cmd.arg(drv_outpath);
+        for nix_drv_struct in nix_derivations_to_build {
+            if Path::new(&nix_drv_struct.outpath).exists() {
+                nix_copy_cmd.arg(&nix_drv_struct.outpath);
             }
         }
         let nix_copy_cmd_output = nix_copy_cmd.output();
         if !did_command_exit_successfully(&nix_copy_cmd_output) {
+            let nix_copy_cmd_output_unwrapped = nix_copy_cmd_output.unwrap();
+            let nix_copy_cmd_stderr =
+                String::from_utf8_lossy(&nix_copy_cmd_output_unwrapped.stderr)
+                    .trim()
+                    .to_string();
+            let nix_copy_errors = nix_copy_cmd_stderr
+                .lines()
+                .filter(|line| line.starts_with("error:"))
+                .map(|line| format!("Warning: nix copy: {}", line))
+                .collect::<Vec<String>>();
             eprintln!(
-                "Warning: Some paths could not be copied to the remote machine at '{}'",
-                machine_uri
+                "Warning: Some paths could not be copied to the remote machine at '{}'\n{}",
+                machine_uri,
+                nix_copy_errors.join("\n")
             );
         }
     }

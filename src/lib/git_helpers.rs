@@ -2,7 +2,7 @@ use crate::command_helpers::did_command_exit_successfully;
 use std::process::Command;
 
 pub fn get_pwd_git_toplevel(passed_dir: &Option<String>) -> (String, bool) {
-    let path_to_operate_on: Option<String> = match passed_dir {
+    let path_to_operate_on = match passed_dir {
         Some(_) => passed_dir.clone(),
         None => match std::env::current_dir() {
             Ok(current_dir) => Some(current_dir.display().to_string()),
@@ -31,6 +31,18 @@ pub fn get_pwd_git_toplevel(passed_dir: &Option<String>) -> (String, bool) {
     } else {
         ("".to_string(), false)
     }
+}
+
+pub fn restore_file(local_git_repo: &str, file_to_restore: &str) -> bool {
+    let mut git_restore_cmd = Command::new("git");
+    git_restore_cmd
+        .arg("-C")
+        .arg(local_git_repo)
+        .arg("restore")
+        .arg("--")
+        .arg(file_to_restore);
+    let git_restore_cmd_output = git_restore_cmd.output();
+    did_command_exit_successfully(&git_restore_cmd_output)
 }
 
 pub fn perform_git_pull(local_git_repo: &str) {
