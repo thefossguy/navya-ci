@@ -743,7 +743,6 @@ fn get_derivations_outpaths(
     flake_store_path: &str,
     max_parallelism: usize,
 ) -> Vec<NixDerivation> {
-    eprintln!("Notice: Calculating the `outPath`s of Nix derivations to be built");
     let mut nix_derivations_struct_object = Vec::with_capacity(nix_derivations_and_systems.len());
 
     for nix_system in supported_nix_systems {
@@ -761,7 +760,7 @@ fn get_derivations_outpaths(
                 .push(drv.to_string());
         }
 
-        for derivation_group in grouped_drvs.values() {
+        for (flake_toplevel_output, derivation_group) in grouped_drvs.iter() {
             let derivation_chunks = derivation_group
                 .chunks(max_parallelism)
                 .map(|chunk| chunk.to_vec())
@@ -790,6 +789,10 @@ fn get_derivations_outpaths(
                             panic!("Could not write to temp file '{}'", nix_expr_path.display())
                         });
 
+                    eprintln!(
+                        "Notice: Evaluating outputs under '{}' for system '{}'",
+                        flake_toplevel_output, nix_system
+                    );
                     let mut nix_eval_cmd = create_nix_command();
                     nix_eval_cmd
                         .arg("eval")
