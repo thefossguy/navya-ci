@@ -876,15 +876,11 @@ fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> boo
     did_command_exit_successfully(&nix_build_cmd.output())
 }
 
-fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation], machine_role: &MachineRole) {
+fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation]) {
     eprintln!("Notice: Starting Nix build");
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
-    let mut nix_build_common_args: Vec<&str> =
-        vec!["build", "--keep-going", "--no-link", "--quiet"];
-    if machine_role == &MachineRole::Server {
-        nix_build_common_args.push("--max-jobs");
-        nix_build_common_args.push("0");
-    }
+    let nix_build_common_args: Vec<&str> = vec!["build", "--keep-going", "--no-link", "--quiet"];
+
     let mut nix_build_cmd = create_nix_command();
     nix_build_cmd.args(&nix_build_common_args);
     nix_build_cmd.args(
@@ -894,6 +890,7 @@ fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation], machine_ro
             .collect::<Vec<String>>(),
     );
     let nix_build_cmd_output = nix_build_cmd.output();
+
     match did_command_exit_successfully(&nix_build_cmd_output) {
         true => {
             notices.extend(
@@ -1019,8 +1016,8 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
 
 pub fn do_nix_build(nix_derivations_to_build: &[NixDerivation], machine_role: &MachineRole) {
     match machine_role {
-        MachineRole::Node => do_nix_build_unwrapped(nix_derivations_to_build, machine_role),
-        MachineRole::Server => do_nix_build_unwrapped(nix_derivations_to_build, machine_role),
+        MachineRole::Node => do_nix_build_unwrapped(nix_derivations_to_build),
+        MachineRole::Server => (),
         MachineRole::QuickCI => do_nix_build_quick_ci(nix_derivations_to_build),
     }
 }
