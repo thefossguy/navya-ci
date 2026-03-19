@@ -13,7 +13,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         perform_nix_flake_update(&nix_config)?;
 
         let current_flake_path = perform_nix_flake_archive(&nix_config.flake_local_reference)?;
-        if flake_path == current_flake_path {
+        let has_missing_paths = has_missing_paths(&nix_config.flake_local_reference);
+
+        if flake_path == current_flake_path || !has_missing_paths {
             std::thread::sleep(std::time::Duration::from_secs(nix_config.sleep_break));
         } else {
             flake_path = current_flake_path;

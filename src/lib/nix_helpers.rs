@@ -7,7 +7,7 @@ use std::{
     collections::HashMap,
     env,
     error::Error,
-    fs,
+    fs, io,
     io::Write,
     path,
     path::Path,
@@ -418,6 +418,25 @@ fn was_lockfile_updated_in_last_sleep_break(flake_local_reference: &str, thresho
             }
         }
     }
+}
+
+pub fn has_missing_paths_unwrapped(flake_local_reference: &str) -> io::Result<bool> {
+    for entry in fs::read_dir(flake_local_reference)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+
+        if let Some(name) = file_name.to_str()
+            && name.starts_with("result-")
+            && name.ends_with("-missing")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub fn has_missing_paths(flake_local_reference: &str) -> bool {
+    has_missing_paths_unwrapped(flake_local_reference).unwrap_or(false)
 }
 
 fn perform_nix_flake_update_unwrapped(flake_local_reference: &str) -> bool {
