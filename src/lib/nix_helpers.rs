@@ -1,7 +1,4 @@
-use crate::{
-    command_helpers::*,
-    git_helpers::{get_pwd_git_toplevel, restore_file},
-};
+use crate::{command_helpers::*, git_helpers::get_pwd_git_toplevel};
 
 use std::{
     collections::HashMap,
@@ -458,7 +455,7 @@ fn perform_nix_flake_update_unwrapped(flake_local_reference: &str) -> bool {
     did_command_exit_successfully(&nix_flake_update_cmd_output)
 }
 
-pub fn perform_nix_flake_update(nix_config: &NixConfig) -> Result<(), Box<dyn Error>> {
+pub fn perform_nix_flake_update(nix_config: &NixConfig) {
     if nix_config.update_lockfile {
         match was_lockfile_updated_in_last_sleep_break(
             &nix_config.flake_local_reference,
@@ -469,35 +466,16 @@ pub fn perform_nix_flake_update(nix_config: &NixConfig) -> Result<(), Box<dyn Er
                     "Notice: It appears that the lockfile was updated in the last {} seconds, skipping a lockfile update to be under any GitHub API rate limit(s)",
                     nix_config.sleep_break
                 );
-                Ok(())
             }
             false => match perform_nix_flake_update_unwrapped(&nix_config.flake_local_reference) {
-                true => Ok(()),
+                true => (),
                 false => {
                     eprintln!(
-                        "Warning: Encountered an error updating the lockfile of the specified flake, restoring the lockfile and retrying it once again"
+                        "Warning: Encountered an error updating the lockfile of the specified flake"
                     );
-                    match restore_file(&nix_config.flake_local_reference, "flake.lock") {
-                        false => {
-                            Err("Could not restore the lockfile of the specified flake".into())
-                        }
-                        true => {
-                            match perform_nix_flake_update_unwrapped(
-                                &nix_config.flake_local_reference,
-                            ) {
-                                true => Ok(()),
-                                false => {
-                                    Err("Could not update the lockfile of the specified flake"
-                                        .into())
-                                }
-                            }
-                        }
-                    }
                 }
             },
         }
-    } else {
-        Ok(())
     }
 }
 
@@ -1087,31 +1065,35 @@ pub fn do_nix_sign(
     signing_key_path: &str,
     ignore_signing_error: bool,
 ) -> Result<(), Box<dyn Error>> {
-    eprintln!("Notice: Signing built paths using specified key");
+    if !signing_key_path.is_empty() {
+        eprintln!("Notice: Signing built paths using specified key");
 
-    let mut nix_store_sign_cmd = create_nix_command();
-    nix_store_sign_cmd
-        .arg("store")
-        .arg("sign")
-        .arg("--recursive")
-        .arg("--key-file")
-        .arg(signing_key_path);
-    for nix_drv_struct in nix_derivations_to_build {
-        if Path::new(&nix_drv_struct.outpath).exists() {
-            nix_store_sign_cmd.arg(&nix_drv_struct.outpath);
-        }
-    }
-    let nix_store_sign_cmd_output = nix_store_sign_cmd.output();
-
-    match did_command_exit_successfully(&nix_store_sign_cmd_output) {
-        true => Ok(()),
-        false => match ignore_signing_error {
-            true => {
-                eprintln!("Warning: Signing store paths failed, ignoring the error");
-                Ok(())
+        let mut nix_store_sign_cmd = create_nix_command();
+        nix_store_sign_cmd
+            .arg("store")
+            .arg("sign")
+            .arg("--recursive")
+            .arg("--key-file")
+            .arg(signing_key_path);
+        for nix_drv_struct in nix_derivations_to_build {
+            if Path::new(&nix_drv_struct.outpath).exists() {
+                nix_store_sign_cmd.arg(&nix_drv_struct.outpath);
             }
-            false => Err("Signing store paths failed".into()),
-        },
+        }
+        let nix_store_sign_cmd_output = nix_store_sign_cmd.output();
+
+        match did_command_exit_successfully(&nix_store_sign_cmd_output) {
+            true => Ok(()),
+            false => match ignore_signing_error {
+                true => {
+                    eprintln!("Warning: Signing store paths failed, ignoring the error");
+                    Ok(())
+                }
+                false => Err("Signing store paths failed".into()),
+            },
+        }
+    } else {
+        Ok(())
     }
 }
 

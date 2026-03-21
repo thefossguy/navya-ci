@@ -10,12 +10,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     loop {
         perform_git_pull(&nix_config.flake_local_reference);
-        perform_nix_flake_update(&nix_config)?;
+        perform_nix_flake_update(&nix_config);
 
         let current_flake_path = perform_nix_flake_archive(&nix_config.flake_local_reference)?;
-        let has_missing_paths = has_missing_paths(&nix_config.flake_local_reference);
-
-        if flake_path == current_flake_path || !has_missing_paths {
+        if flake_path == current_flake_path {
             std::thread::sleep(std::time::Duration::from_secs(nix_config.sleep_break));
         } else {
             flake_path = current_flake_path;
@@ -39,6 +37,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "Notice: All jobs for the current flake state ('{}') are complete",
                 flake_path
             );
+
+            if has_missing_paths(&nix_config.flake_local_reference) {
+                flake_path = "".to_string();
+            }
         }
 
         if nix_config.machine_role == MachineRole::QuickCI {
