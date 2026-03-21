@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     env,
     error::Error,
-    fs, io,
+    fs,
     io::Write,
     path,
     path::Path,
@@ -415,25 +415,6 @@ fn was_lockfile_updated_in_last_sleep_break(flake_local_reference: &str, thresho
             }
         }
     }
-}
-
-pub fn has_missing_paths_unwrapped(flake_local_reference: &str) -> io::Result<bool> {
-    for entry in fs::read_dir(flake_local_reference)? {
-        let entry = entry?;
-        let file_name = entry.file_name();
-
-        if let Some(name) = file_name.to_str()
-            && name.starts_with("result-")
-            && name.ends_with("-missing")
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub fn has_missing_paths(flake_local_reference: &str) -> bool {
-    has_missing_paths_unwrapped(flake_local_reference).unwrap_or(false)
 }
 
 fn perform_nix_flake_update_unwrapped(flake_local_reference: &str) -> bool {
@@ -1025,7 +1006,8 @@ pub fn do_nix_build(nix_derivations_to_build: &[NixDerivation], machine_role: &M
 pub fn create_nix_gc_roots(
     nix_derivations_to_build: &[NixDerivation],
     flake_local_reference: &str,
-) {
+) -> bool {
+    let mut created_all_nix_gc_roots = true;
     assert!(nix_derivations_to_build.len() < 1000);
     for file_entry in fs::read_dir(flake_local_reference).unwrap() {
         let file_path = file_entry.unwrap().path();
@@ -1051,6 +1033,7 @@ pub fn create_nix_gc_roots(
                 .arg(out_link);
             let _ = nix_build_cmd.output();
         } else {
+            created_all_nix_gc_roots = false;
             let out_link = format!("{}-missing", out_link);
             let _ = std::os::unix::fs::symlink(
                 format!("/missing{}", &nix_drv_struct.outpath),
@@ -1058,6 +1041,7 @@ pub fn create_nix_gc_roots(
             );
         }
     }
+    created_all_nix_gc_roots
 }
 
 pub fn do_nix_sign(
@@ -1102,9 +1086,10 @@ pub fn do_nix_copy(
     machine_role: &MachineRole,
     nix_copy_machines: &[String],
     copy_unsigned_paths: bool,
-) {
+) -> bool {
+    let mut nix_copy_successful = true;
     if machine_role == &MachineRole::QuickCI || nix_copy_machines.is_empty() {
-        return;
+        return nix_copy_successful;
     }
 
     eprintln!("Notice: Copying built paths to specified remote(s)");
@@ -1125,6 +1110,7 @@ pub fn do_nix_copy(
         }
         let nix_copy_cmd_output = nix_copy_cmd.output();
         if !did_command_exit_successfully(&nix_copy_cmd_output) {
+            nix_copy_successful = false;
             let nix_copy_cmd_output_unwrapped = nix_copy_cmd_output.unwrap();
             let nix_copy_cmd_stderr =
                 String::from_utf8_lossy(&nix_copy_cmd_output_unwrapped.stderr)
@@ -1142,4 +1128,5 @@ pub fn do_nix_copy(
             );
         }
     }
+    nix_copy_successful
 }

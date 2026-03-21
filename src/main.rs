@@ -21,13 +21,14 @@ fn main() -> Result<(), Box<dyn Error>> {
 
             let nix_derivations_to_build = get_nix_derivations_to_build(&nix_config, &flake_path)?;
             do_nix_build(&nix_derivations_to_build, &nix_config.machine_role);
-            create_nix_gc_roots(&nix_derivations_to_build, &nix_config.flake_local_reference);
+            let created_all_nix_gc_roots =
+                create_nix_gc_roots(&nix_derivations_to_build, &nix_config.flake_local_reference);
             do_nix_sign(
                 &nix_derivations_to_build,
                 &nix_config.signing_key_path,
                 nix_config.ignore_signing_error,
             )?;
-            do_nix_copy(
+            let nix_copy_successful = do_nix_copy(
                 &nix_derivations_to_build,
                 &nix_config.machine_role,
                 &nix_config.nix_copy_machines,
@@ -38,7 +39,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 flake_path
             );
 
-            if has_missing_paths(&nix_config.flake_local_reference) {
+            let skip_sleep_break = !created_all_nix_gc_roots || !nix_copy_successful;
+            if skip_sleep_break {
                 flake_path = "".to_string();
             }
         }
