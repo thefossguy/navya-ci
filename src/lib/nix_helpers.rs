@@ -931,6 +931,7 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     let mut nix_binary_caches: Vec<String> = Vec::new();
     let mut encountered_uncached_paths = false;
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
+    let mut missing_notices: Vec<String> = Vec::new();
 
     let mut nix_config_show_cmd = create_nix_command();
     nix_config_show_cmd.arg("config").arg("show");
@@ -977,7 +978,7 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
                 }
                 false => {
                     encountered_uncached_paths = true;
-                    notices.push(format!(
+                    missing_notices.push(format!(
                         "Notice: The Nix attribute '{}' is NOT cached ('{}')",
                         nix_drv_struct.derivation_attribute, nix_drv_struct.outpath
                     ));
@@ -987,6 +988,8 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     }
 
     notices.sort();
+    missing_notices.sort();
+    notices.extend(missing_notices);
     eprintln!("{}", notices.join("\n"));
 
     if encountered_uncached_paths {
