@@ -84,11 +84,11 @@ fn print_help() {
     --flake-path [FLAKE_PATH]                    Specify the local flake path
     --nix-system [NIX_SYSTEM]...                 The Nix system(s) to build derivations for (see bottom for supported
                                                  Nix systems)
+    --machine-role [node|server|quick_ci]        The role of this system, only one of the specified values
     --flake-output-to-build [FLAKE_OUTPUT]...    The flake toplevel output(s) to build
 
     --ignore-missing-flake-outputs               Specifying this argument will ensure if any specified flake toplevel
                                                  output(s) are missing, will be treated as a warning, not an error
-    --machine-role [node|server|quick_ci]        The role of this system, only one of the specified values
     --sleep-break [SECONDS]                      Time in seconds to sleep for between two continuous runs, if there is
                                                  no change to the flake (default is 600)
     --update-lockfile                            Specifying this argument will ensure that the lockfile is updated
