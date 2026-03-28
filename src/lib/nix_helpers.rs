@@ -56,6 +56,7 @@ pub struct NixConfig {
     pub nix_copy_machines: Vec<String>,
     pub copy_unsigned_paths: bool,
     pub max_parallelism: usize,
+    pub ignore_derivations_eval_errors: bool,
 }
 
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord)]
@@ -93,6 +94,8 @@ fn print_help() {
                                                  no change to the flake (default is 600)
     --update-lockfile                            Specifying this argument will ensure that the lockfile is updated
                                                  \"manually\" by `navya-ci`, instead of relying on `git-pull`s
+    --ignore-derivations-eval-errors             Treat derivation evaluation errors as warnings, instead of hard
+                                                 stopping errors.
     --signing-key-path [SIGNING_KEY_PATH]        File path used to sign Nix store paths
     --ignore-signing-error                       Specifying this argument will treat signing errors by the use of the
                                                  specified signing key file, as warnings
@@ -140,6 +143,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
     let mut copy_unsigned_paths: bool = false;
     let total_mem = memtotal / 1024 / 1024;
     let mut max_parallelism: usize = total_mem / 2;
+    let mut ignore_derivations_eval_errors = false;
 
     while let Some(arg) = parser.next()? {
         match arg {
@@ -205,6 +209,10 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
 
             Long("update-lockfile") => {
                 update_lockfile = true;
+            }
+
+            Long("ignore-derivations-eval-errors") => {
+                ignore_derivations_eval_errors = true;
             }
 
             Long("signing-key-path") => {
@@ -384,6 +392,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
         nix_copy_machines,
         copy_unsigned_paths,
         max_parallelism,
+        ignore_derivations_eval_errors,
     })
 }
 
@@ -715,13 +724,51 @@ fn find_flake_drvs_to_build(
     Ok(nix_derivations_to_build)
 }
 
+fn get_indv_derivation_outpath(
+    nix_eval_cmd_args: &[&str],
+    indv_drv: String,
+    flake_store_path: String,
+    nix_system: String,
+) -> Option<NixDerivation> {
+    let mut nix_eval_cmd = create_nix_command();
+    nix_eval_cmd
+        .args(nix_eval_cmd_args)
+        .arg("--raw")
+        .arg(format!("{}#{}", flake_store_path, indv_drv));
+    let nix_eval_cmd_output = nix_eval_cmd.output();
+    match did_command_exit_successfully(&nix_eval_cmd_output) {
+        false => {
+            eprintln!(
+                "Warning: Could not evaluate outPath of this Nix attribute: {}",
+                indv_drv
+            );
+            None
+        }
+        true => {
+            let nix_eval_cmd_output_unwrapped = nix_eval_cmd_output.unwrap();
+            let nix_eval_cmd_stdout =
+                String::from_utf8_lossy(&nix_eval_cmd_output_unwrapped.stdout)
+                    .trim()
+                    .to_string();
+            Some(build_nix_derivation_struct_object(
+                indv_drv,
+                nix_eval_cmd_stdout,
+                flake_store_path,
+                nix_system,
+            ))
+        }
+    }
+}
+
 fn get_derivations_outpaths(
     nix_derivations_and_systems: &HashMap<String, String>,
     supported_nix_systems: &[String],
     flake_store_path: &str,
     max_parallelism: usize,
+    ignore_derivations_eval_errors: bool,
 ) -> Vec<NixDerivation> {
     let mut nix_derivations_struct_object = Vec::with_capacity(nix_derivations_and_systems.len());
+    let mut encountered_derivations_without_outpaths = false;
 
     for nix_system in supported_nix_systems {
         let mut grouped_drvs: HashMap<String, Vec<String>> = HashMap::new();
@@ -771,26 +818,39 @@ fn get_derivations_outpaths(
                         "Notice: Evaluating outputs under '{}' for system '{}'",
                         flake_toplevel_output, nix_system
                     );
+                    let nix_eval_cmd_args = vec![
+                        "eval",
+                        "--option",
+                        "eval-cache",
+                        "true",
+                        "--option",
+                        "eval-system",
+                        nix_system,
+                    ];
                     let mut nix_eval_cmd = create_nix_command();
                     nix_eval_cmd
-                        .arg("eval")
-                        .arg("--option")
-                        .arg("eval-cache")
-                        .arg("true")
+                        .args(&nix_eval_cmd_args)
                         .arg("--json")
-                        .arg("--option")
-                        .arg("eval-system")
-                        .arg(nix_system)
                         .arg("--file")
                         .arg(&nix_expr_path);
                     let nix_eval_cmd_output = nix_eval_cmd.output();
                     let _ = fs::remove_file(&nix_expr_path);
                     match did_command_exit_successfully(&nix_eval_cmd_output) {
                         false => {
-                            eprintln!(
-                                "Warning: Could not evaluate outPaths of these Nix attributes: '{:?}'",
-                                derivations
-                            )
+                            for indv_drv in derivations {
+                                match get_indv_derivation_outpath(
+                                    &nix_eval_cmd_args,
+                                    indv_drv,
+                                    flake_store_path.to_string(),
+                                    nix_system.to_string(),
+                                ) {
+                                    None => encountered_derivations_without_outpaths = true,
+                                    Some(nix_derivation_struct_obj) => {
+                                        nix_derivations_struct_object
+                                            .push(nix_derivation_struct_obj)
+                                    }
+                                }
+                            }
                         }
                         true => {
                             let nix_eval_cmd_output_unwrapped = nix_eval_cmd_output.unwrap();
@@ -823,6 +883,10 @@ fn get_derivations_outpaths(
         }
     }
 
+    if encountered_derivations_without_outpaths && !ignore_derivations_eval_errors {
+        process::exit(1);
+    }
+
     nix_derivations_struct_object.sort();
     nix_derivations_struct_object
 }
@@ -846,6 +910,7 @@ pub fn get_nix_derivations_to_build(
         &nix_config.nix_systems,
         flake_store_path,
         nix_config.max_parallelism,
+        nix_config.ignore_derivations_eval_errors,
     );
 
     Ok(nix_derivations_to_build)
