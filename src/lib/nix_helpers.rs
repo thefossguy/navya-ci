@@ -5,8 +5,6 @@ use std::{
     env,
     error::Error,
     fs,
-    io::Write,
-    path,
     path::Path,
     process,
     process::Command,
@@ -508,17 +506,6 @@ pub fn perform_nix_flake_archive(flake_local_reference: &str) -> Result<String, 
     }
 }
 
-fn create_tmp_file() -> Result<(fs::File, path::PathBuf), Box<dyn Error>> {
-    let mut path = env::temp_dir();
-    let unique = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    path.push(format!("nix-expr-{}-{}", process::id(), unique));
-    let file = fs::File::create(&path)?;
-    Ok((file, path))
-}
-
 fn get_flake_toplevel_outputs(
     flake_store_path: &str,
     flake_outputs_to_find: &[String],
@@ -527,32 +514,21 @@ fn get_flake_toplevel_outputs(
     eprintln!(
         "Notice: Checking if specified flake outputs to build are present in the `<flake>.outputs`"
     );
+
     let nix_expr_string = format!(
-        "let flake = builtins.getFlake \"{}\"; in builtins.attrNames flake.outputs",
+        "builtins.attrNames (builtins.getFlake \"{}\").outputs",
         flake_store_path
     );
-    let (mut nix_expr_file, nix_expr_path) = create_tmp_file().unwrap_or_else(|_| {
-        panic!(
-            "Could not create a temp file to store the Nix expression '{}'",
-            nix_expr_string
-        )
-    });
-    nix_expr_file
-        .write_all(nix_expr_string.as_bytes())
-        .unwrap_or_else(|_| panic!("Could not write to temp file '{}'", nix_expr_path.display()));
-
-    let mut nix_eval_cmd = create_nix_command();
+    let mut nix_eval_cmd = Command::new("nix-instantiate");
     nix_eval_cmd
-        .arg("eval")
         .arg("--option")
         .arg("eval-cache")
         .arg("true")
+        .arg("--eval")
         .arg("--json")
-        .arg("--pretty")
-        .arg("--file")
-        .arg(&nix_expr_path);
+        .arg("--expr")
+        .arg(nix_expr_string);
     let nix_eval_cmd_output = nix_eval_cmd.output();
-    let _ = fs::remove_file(&nix_expr_path);
     match did_command_exit_successfully(&nix_eval_cmd_output) {
         false => Err("Could not find the toplevel outputs of the specified flake".into()),
         true => {
@@ -568,7 +544,7 @@ fn get_flake_toplevel_outputs(
                     .to_string();
 
             for flake_output in flake_outputs_to_find.iter() {
-                let pattern = format!(" \"{}\"", flake_output);
+                let pattern = format!("\"{}\"", flake_output);
                 if nix_eval_cmd_stdout.contains(&pattern) {
                     flake_outputs_found.push(flake_output.to_string());
                 } else {
@@ -599,16 +575,19 @@ fn is_flake_output_arch_dependant(
     flake_store_path: &str,
     flake_output: &str,
 ) -> Result<bool, Box<dyn Error>> {
-    let mut nix_eval_cmd = create_nix_command();
+    let nix_expr_string = format!(
+        "builtins.attrNames (builtins.getFlake \"{}\").outputs.{}",
+        flake_store_path, flake_output
+    );
+    let mut nix_eval_cmd = Command::new("nix-instantiate");
     nix_eval_cmd
-        .arg("eval")
         .arg("--option")
         .arg("eval-cache")
         .arg("true")
+        .arg("--eval")
         .arg("--json")
-        .arg("--apply")
-        .arg("builtins.attrNames")
-        .arg(format!("{}#{}", flake_store_path, flake_output));
+        .arg("--expr")
+        .arg(nix_expr_string);
     let nix_eval_cmd_output = nix_eval_cmd.output();
     match did_command_exit_successfully(&nix_eval_cmd_output) {
         false => Err(format!("Could not determine if the flake output '{}' is dependant on architecture (ISA/Nix system) or not", flake_output).into()),
@@ -675,19 +654,34 @@ fn find_flake_drvs_to_build(
     for flake_output in flake_outputs_to_build {
         let is_flake_output_arch_dependant =
             is_flake_output_arch_dependant(flake_store_path, flake_output)?;
-        let mut nix_eval_cmd = create_nix_command();
+        let mut nix_eval_cmd = Command::new("nix-instantiate");
         nix_eval_cmd
-            .arg("eval")
             .arg("--option")
             .arg("eval-cache")
             .arg("true")
-            .arg(format!("{}#{}", flake_store_path, flake_output))
+            .arg("--eval")
             .arg("--json")
-            .arg("--apply");
+            .arg("--strict")
+            .arg("--expr");
         if is_flake_output_arch_dependant {
-            nix_eval_cmd.arg(format!("output: let systems = [ \"{}\" ]; in builtins.foldl' (acc: system: acc // {{ ${{system}} = builtins.attrNames output.${{system}}; }}) {{}} systems", supported_nix_systems.join("\" \"")));
+            nix_eval_cmd.arg(format!("
+              let
+                systems = [ \"{}\" ];
+                output = (builtins.getFlake \"{}\").outputs.{};
+              in
+              builtins.foldl'
+                (acc: system: acc // {{ ${{system}} = builtins.attrNames output.${{system}}; }}) {{}} systems
+            ", supported_nix_systems.join("\" \""), flake_store_path, flake_output));
         } else {
-            nix_eval_cmd.arg(format!("configs: let wantedSystems = [ \"{}\" ]; filtered = builtins.filter (n: builtins.elem configs.${{n}}.config.nixpkgs.hostPlatform.system wantedSystems) (builtins.attrNames configs); in builtins.foldl' (acc: n: let arch = configs.${{n}}.config.nixpkgs.hostPlatform.system; in acc // {{ ${{arch}} = (acc.${{arch}} or []) ++ [n]; }}) {{}} filtered", supported_nix_systems.join("\" \"")));
+            nix_eval_cmd.arg(format!("
+              let
+                wantedSystems = [ \"{}\" ];
+                configs = (builtins.getFlake \"{}\").outputs.{};
+                filtered = builtins.filter (n: builtins.elem configs.${{n}}.config.nixpkgs.hostPlatform.system wantedSystems) (builtins.attrNames configs);
+              in
+              builtins.foldl'
+                (acc: n: let arch = configs.${{n}}.config.nixpkgs.hostPlatform.system; in acc // {{ ${{arch}} = (acc.${{arch}} or []) ++ [n]; }}) {{}} filtered
+            ", supported_nix_systems.join("\" \""), flake_store_path, flake_output));
         }
         let nix_eval_cmd_output = nix_eval_cmd.output();
         match did_command_exit_successfully(&nix_eval_cmd_output) {
@@ -754,11 +748,16 @@ fn get_indv_derivation_outpath(
     flake_store_path: String,
     nix_system: String,
 ) -> Option<NixDerivation> {
-    let mut nix_eval_cmd = create_nix_command();
+    let nix_expr_string = format!(
+        "(builtins.getFlake \"{}\").outputs.{}.drvPath",
+        flake_store_path, indv_drv
+    );
+    let mut nix_eval_cmd = Command::new("nix-instantiate");
     nix_eval_cmd
         .args(nix_eval_cmd_args)
         .arg("--raw")
-        .arg(format!("{}#{}.drvPath", flake_store_path, indv_drv));
+        .arg("--expr")
+        .arg(nix_expr_string);
     let nix_eval_cmd_output = nix_eval_cmd.output();
     match did_command_exit_successfully(&nix_eval_cmd_output) {
         false => {
@@ -818,47 +817,37 @@ fn get_derivations_outpaths(
                 if !derivations.is_empty() {
                     let derivation_expr = derivations
                         .iter()
-                        .map(|indv_drv| format!("\"{}\" = flake.{}.drvPath;", indv_drv, indv_drv))
+                        .map(|indv_drv| {
+                            format!("\"{}\" = flake.outputs.{}.drvPath;", indv_drv, indv_drv)
+                        })
                         .collect::<Vec<_>>()
                         .join(" ");
-                    let eval_string = format!(
+                    let nix_eval_string = format!(
                         "let flake = builtins.getFlake \"{}\"; in {{ {} }}",
                         flake_store_path, derivation_expr
                     );
-                    let (mut nix_expr_file, nix_expr_path) =
-                        create_tmp_file().unwrap_or_else(|_| {
-                            panic!(
-                                "Could not create a temp file to store the Nix expression '{}'",
-                                eval_string
-                            )
-                        });
-                    nix_expr_file
-                        .write_all(eval_string.as_bytes())
-                        .unwrap_or_else(|_| {
-                            panic!("Could not write to temp file '{}'", nix_expr_path.display())
-                        });
 
                     eprintln!(
                         "Notice: Evaluating outputs under '{}' for system '{}'",
                         flake_toplevel_output, nix_system
                     );
                     let nix_eval_cmd_args = vec![
-                        "eval",
                         "--option",
                         "eval-cache",
                         "true",
+                        "--eval",
                         "--option",
                         "eval-system",
                         nix_system,
                     ];
-                    let mut nix_eval_cmd = create_nix_command();
+                    let mut nix_eval_cmd = Command::new("nix-instantiate");
                     nix_eval_cmd
                         .args(&nix_eval_cmd_args)
                         .arg("--json")
-                        .arg("--file")
-                        .arg(&nix_expr_path);
+                        .arg("--strict")
+                        .arg("--expr")
+                        .arg(&nix_eval_string);
                     let nix_eval_cmd_output = nix_eval_cmd.output();
-                    let _ = fs::remove_file(&nix_expr_path);
                     match did_command_exit_successfully(&nix_eval_cmd_output) {
                         false => {
                             for indv_drv in derivations {
