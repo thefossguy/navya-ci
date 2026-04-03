@@ -67,7 +67,7 @@ pub struct NixDerivation {
     pub outpath: String,
 }
 
-fn create_nix_command() -> Command {
+fn create_nix3_command() -> Command {
     let mut nix_command = Command::new("nix");
     nix_command
         .arg("--extra-experimental-features")
@@ -297,7 +297,7 @@ pub fn get_nix_config() -> Result<NixConfig, lexopt::Error> {
             "At least one supported Nix system must be specified with `--nix-system`".into(),
         );
     } else {
-        let mut nix_config_show_cmd = create_nix_command();
+        let mut nix_config_show_cmd = create_nix3_command();
         nix_config_show_cmd.arg("config").arg("show");
         let nix_config_show_cmd_output = nix_config_show_cmd.output();
         match did_command_exit_successfully(&nix_config_show_cmd_output) {
@@ -426,7 +426,7 @@ fn was_lockfile_updated_in_last_sleep_break(flake_local_reference: &str, thresho
 }
 
 fn perform_nix_flake_update_unwrapped(flake_local_reference: &str) -> bool {
-    let mut nix_flake_update_cmd = create_nix_command();
+    let mut nix_flake_update_cmd = create_nix3_command();
     nix_flake_update_cmd
         .arg("flake")
         .arg("update")
@@ -469,7 +469,7 @@ pub fn perform_nix_flake_update(nix_config: &NixConfig) {
 }
 
 pub fn perform_nix_flake_archive(flake_local_reference: &str) -> Result<String, Box<dyn Error>> {
-    let mut nix_flake_archive_cmd = create_nix_command();
+    let mut nix_flake_archive_cmd = create_nix3_command();
     nix_flake_archive_cmd
         .arg("flake")
         .arg("archive")
@@ -932,7 +932,7 @@ pub fn get_nix_derivations_to_build(
 }
 
 fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> bool {
-    let mut nix_build_cmd = create_nix_command();
+    let mut nix_build_cmd = create_nix3_command();
     nix_build_cmd.args(nix_build_common_args).arg(nix_drv);
     did_command_exit_successfully(&nix_build_cmd.output())
 }
@@ -942,7 +942,7 @@ fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation]) {
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
     let nix_build_common_args: Vec<&str> = vec!["build", "--keep-going", "--no-link", "--quiet"];
 
-    let mut nix_build_cmd = create_nix_command();
+    let mut nix_build_cmd = create_nix3_command();
     nix_build_cmd.args(&nix_build_common_args);
     nix_build_cmd.args(
         nix_derivations_to_build
@@ -991,7 +991,7 @@ fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation]) {
 fn is_drv_store_path_cached(drv_store_path: &str, nix_caches: &[String]) -> bool {
     let mut encountered_path_in_cache: bool = false;
     for remote_store in nix_caches {
-        let mut nix_path_info_cmd = create_nix_command();
+        let mut nix_path_info_cmd = create_nix3_command();
         nix_path_info_cmd
             .arg("path-info")
             .arg("--refresh")
@@ -1013,7 +1013,7 @@ fn do_nix_build_quick_ci(nix_derivations_to_build: &[NixDerivation]) {
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
     let mut missing_notices: Vec<String> = Vec::new();
 
-    let mut nix_config_show_cmd = create_nix_command();
+    let mut nix_config_show_cmd = create_nix3_command();
     nix_config_show_cmd.arg("config").arg("show");
     let nix_config_show_cmd_output = nix_config_show_cmd.output();
     match did_command_exit_successfully(&nix_config_show_cmd_output) {
@@ -1108,7 +1108,7 @@ pub fn create_nix_gc_roots(
             let _ = fs::remove_file(&out_link);
         }
         if Path::new(&nix_drv_struct.outpath).exists() {
-            let mut nix_build_cmd = create_nix_command();
+            let mut nix_build_cmd = create_nix3_command();
             nix_build_cmd
                 .arg("build")
                 .arg(&nix_drv_struct.outpath)
@@ -1135,7 +1135,7 @@ pub fn do_nix_sign(
     if !signing_key_path.is_empty() {
         eprintln!("Notice: Signing built paths using specified key");
 
-        let mut nix_store_sign_cmd = create_nix_command();
+        let mut nix_store_sign_cmd = create_nix3_command();
         nix_store_sign_cmd
             .arg("store")
             .arg("sign")
@@ -1177,7 +1177,7 @@ pub fn do_nix_copy(
 
     eprintln!("Notice: Copying built paths to specified remote(s)");
     for machine_uri in nix_copy_machines {
-        let mut nix_copy_cmd = create_nix_command();
+        let mut nix_copy_cmd = create_nix3_command();
         nix_copy_cmd
             .arg("copy")
             .arg("--refresh")
