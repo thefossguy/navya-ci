@@ -65,6 +65,7 @@ pub struct NixDerivation {
     pub flake_store_path: String,
     pub fully_qualified_derivation_path: String,
     pub derivation_host_platform: String,
+    pub drvpath: String,
     pub outpath: String,
 }
 
@@ -626,17 +627,40 @@ fn is_flake_output_arch_dependant(
 
 fn build_nix_derivation_struct_object(
     derivation_attribute: String,
-    evaluated_outpath: String,
+    evaluated_drvpath: String,
     flake_store_path: String,
     derivation_host_platform: String,
-) -> NixDerivation {
+) -> Option<NixDerivation> {
     let fully_qualified_derivation_path = format!("{}#{}", flake_store_path, derivation_attribute);
-    NixDerivation {
-        derivation_attribute,
-        flake_store_path,
-        fully_qualified_derivation_path,
-        derivation_host_platform,
-        outpath: evaluated_outpath,
+    let mut nix_store_query_cmd = Command::new("nix-store");
+    nix_store_query_cmd
+        .arg("--query")
+        .arg("--outputs")
+        .arg(&evaluated_drvpath);
+    let nix_store_query_cmd_output = nix_store_query_cmd.output();
+
+    match did_command_exit_successfully(&nix_store_query_cmd_output) {
+        false => {
+            eprintln!(
+                "Warning: Could not evaluate outPath for attribute '{}'",
+                fully_qualified_derivation_path
+            );
+            None
+        }
+        true => {
+            let nix_store_query_cmd_output_unwrapped = nix_store_query_cmd_output.unwrap();
+            let outpath = String::from_utf8_lossy(&nix_store_query_cmd_output_unwrapped.stdout)
+                .trim()
+                .to_string();
+            Some(NixDerivation {
+                derivation_attribute,
+                flake_store_path,
+                fully_qualified_derivation_path,
+                derivation_host_platform,
+                outpath,
+                drvpath: evaluated_drvpath,
+            })
+        }
     }
 }
 
@@ -734,7 +758,7 @@ fn get_indv_derivation_outpath(
     nix_eval_cmd
         .args(nix_eval_cmd_args)
         .arg("--raw")
-        .arg(format!("{}#{}", flake_store_path, indv_drv));
+        .arg(format!("{}#{}.drvPath", flake_store_path, indv_drv));
     let nix_eval_cmd_output = nix_eval_cmd.output();
     match did_command_exit_successfully(&nix_eval_cmd_output) {
         false => {
@@ -750,12 +774,12 @@ fn get_indv_derivation_outpath(
                 String::from_utf8_lossy(&nix_eval_cmd_output_unwrapped.stdout)
                     .trim()
                     .to_string();
-            Some(build_nix_derivation_struct_object(
+            build_nix_derivation_struct_object(
                 indv_drv,
                 nix_eval_cmd_stdout,
                 flake_store_path,
                 nix_system,
-            ))
+            )
         }
     }
 }
@@ -794,7 +818,7 @@ fn get_derivations_outpaths(
                 if !derivations.is_empty() {
                     let derivation_expr = derivations
                         .iter()
-                        .map(|indv_drv| format!("\"{}\" = flake.{};", indv_drv, indv_drv))
+                        .map(|indv_drv| format!("\"{}\" = flake.{}.drvPath;", indv_drv, indv_drv))
                         .collect::<Vec<_>>()
                         .join(" ");
                     let eval_string = format!(
@@ -865,16 +889,18 @@ fn get_derivations_outpaths(
                                         nix_eval_cmd_stdout
                                     )
                                 });
-                            for (evaluated_nix_derivation, evaluated_outpath) in
+                            for (evaluated_nix_derivation, evaluated_drvpath) in
                                 nix_eval_cmd_stdout_jsonobj.0.iter()
                             {
                                 let nix_derivation_struct_obj = build_nix_derivation_struct_object(
                                     evaluated_nix_derivation.to_string(),
-                                    evaluated_outpath.to_string(),
+                                    evaluated_drvpath.to_string(),
                                     flake_store_path.to_string(),
                                     nix_system.to_string(),
                                 );
-                                nix_derivations_struct_object.push(nix_derivation_struct_obj);
+                                if let Some(nix_derivation_struct_obj) = nix_derivation_struct_obj {
+                                    nix_derivations_struct_object.push(nix_derivation_struct_obj);
+                                }
                             }
                         }
                     }
