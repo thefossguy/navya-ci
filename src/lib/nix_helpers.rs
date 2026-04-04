@@ -932,7 +932,7 @@ pub fn get_nix_derivations_to_build(
 }
 
 fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> bool {
-    let mut nix_build_cmd = create_nix3_command();
+    let mut nix_build_cmd = Command::new("nix-store");
     nix_build_cmd.args(nix_build_common_args).arg(nix_drv);
     did_command_exit_successfully(&nix_build_cmd.output())
 }
@@ -940,14 +940,15 @@ fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> boo
 fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation]) {
     eprintln!("Notice: Starting Nix build");
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
-    let nix_build_common_args: Vec<&str> = vec!["build", "--keep-going", "--no-link", "--quiet"];
+    let nix_build_common_args: Vec<&str> =
+        vec!["--realise", "--keep-going", "--no-link", "--quiet"];
 
-    let mut nix_build_cmd = create_nix3_command();
+    let mut nix_build_cmd = Command::new("nix-store");
     nix_build_cmd.args(&nix_build_common_args);
     nix_build_cmd.args(
         nix_derivations_to_build
             .iter()
-            .map(|nix_drv| nix_drv.fully_qualified_derivation_path.clone())
+            .map(|nix_drv| nix_drv.drvpath.clone())
             .collect::<Vec<String>>(),
     );
     let nix_build_cmd_output = nix_build_cmd.output();
@@ -1108,12 +1109,13 @@ pub fn create_nix_gc_roots(
             let _ = fs::remove_file(&out_link);
         }
         if Path::new(&nix_drv_struct.outpath).exists() {
-            let mut nix_build_cmd = create_nix3_command();
+            let mut nix_build_cmd = Command::new("nix-store");
             nix_build_cmd
-                .arg("build")
-                .arg(&nix_drv_struct.outpath)
-                .arg("--out-link")
-                .arg(out_link);
+                .arg("--realise")
+                .arg(nix_drv_struct.outpath.clone())
+                .arg("--add-root")
+                .arg(out_link)
+                .arg("--indirect");
             let _ = nix_build_cmd.output();
         } else {
             created_all_nix_gc_roots = false;
