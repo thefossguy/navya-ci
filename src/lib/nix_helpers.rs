@@ -940,8 +940,7 @@ fn do_single_drv_nix_build(nix_drv: &str, nix_build_common_args: &[&str]) -> boo
 fn do_nix_build_unwrapped(nix_derivations_to_build: &[NixDerivation]) {
     eprintln!("Notice: Starting Nix build");
     let mut notices: Vec<String> = Vec::with_capacity(nix_derivations_to_build.len());
-    let nix_build_common_args: Vec<&str> =
-        vec!["--realise", "--keep-going", "--no-link", "--quiet"];
+    let nix_build_common_args: Vec<&str> = vec!["--realise", "--keep-going", "--quiet"];
 
     let mut nix_build_cmd = Command::new("nix-store");
     nix_build_cmd.args(&nix_build_common_args);
